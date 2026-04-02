@@ -1,15 +1,21 @@
 package com.android.weatherforecastapp.data
 
+import android.database.sqlite.SQLiteException
+import com.android.weatherforecastapp.ApiKey
+import retrofit2.HttpException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.net.UnknownHostException
+import java.sql.SQLXML
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import javax.inject.Inject
 
-class WeatherRepository(
+class WeatherRepository  @Inject constructor(
     private val api: WeatherApi,
     private val dao: ForecastDao,
-    private val apiKey: String
+    @ApiKey private val apiKey: String
 ) {
 
     private val dateFormatter = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
@@ -17,15 +23,17 @@ class WeatherRepository(
     suspend fun getThreeDayForecast(city: String, forceRefresh: Boolean = false): List<ForecastDay> {
         return withContext(Dispatchers.IO) {
             val local = dao.getForecastForCity(city)
-            if (local.isNotEmpty() && !forceRefresh) {
+            val isCacheValid = local.isNotEmpty() && !isCacheExpired(local.first())
+            if (isCacheValid && !forceRefresh) {
                 return@withContext local.map { it.toDomain() }
             }
 
             try {
                 val remote = api.getForecast(city, apiKey)
                 val days = aggregateToThreeDays(remote)
+                val normalizedCity = remote.city.name.trim().lowercase()
 
-                dao.clearForecastForCity(remote.city.name)
+                dao.clearForecastForCity(normalizedCity)
                 dao.insertAll(
                     days.map {
                         ForecastEntity(
@@ -39,14 +47,20 @@ class WeatherRepository(
                         )
                     }
                 )
-
                 days
-            } catch (e: Exception) {
-                if (local.isNotEmpty()) {
-                    local.map { it.toDomain() }
-                } else {
-                    throw e
+            }
+            catch (e: Exception) {
+                val message = when (e) {
+                    is retrofit2.HttpException -> when (e.code()) {
+                        404 -> "City not found. Please check the city name and try again."
+                        400 -> "Bad request. Please check the city name and try again."
+                        else -> e.message ?: "Failed to load forecast"
+                    }
+
+                    is UnknownHostException -> "No internet connection. Check your network or try on a real device."
+                    else -> e.message ?: "Failed to load forecast"
                 }
+                throw Exception(message)
             }
         }
     }
@@ -80,5 +94,13 @@ class WeatherRepository(
                     iconUrl = weather?.icon?.let { "https://openweathermap.org/img/wn/${it}@2x.png" } ?: ""
                 )
             }
+    }
+
+
+    private  val CACHE_TIMEOUT= 60 * 60 * 1000L // 1 hour in milliseconds
+    private fun isCacheExpired(entity: ForecastEntity):Boolean{
+        val currentTime =System.currentTimeMillis()
+        return currentTime - entity.timestamp>CACHE_TIMEOUT
+
     }
 }
